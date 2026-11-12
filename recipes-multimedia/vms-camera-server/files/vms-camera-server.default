@@ -1,0 +1,4 @@
+# /etc/init.d/vms-camera-server가 vms_camera_server에 넘기는 명령행 인자.
+# 포트와 마운트 경로는 VMS 서버의 --camera 인자(rtsp://<BBB 주소>:8554/cam)와 맞아야 한다.
+# 해상도와 fps를 적지 않으면 앱의 기본값(640x480, 30 fps)을 쓴다. 값을 바꾼 뒤에는 서비스를 restart한다.
+VMS_CAMERA_SERVER_ARGS="--port 8554 --mount /cam"

@@ -1,0 +1,120 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          vms-camera-server
+# Required-Start:    $syslog $network
+# Required-Stop:     $syslog $network
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: USB 카메라 영상을 RTSP로 제공하는 카메라 서버
+### END INIT INFO
+
+# vms_camera_server를 시작하고 멈춘다. 서버의 표준 출력과 표준 오류는 syslog에 태그 vms-camera-server로 기록한다.
+# 서버가 스스로 끝나도 다시 시작하지 않는다. 원인은 /var/log/messages에서 확인한다.
+
+DAEMON=/usr/bin/vms_camera_server
+NAME=vms-camera-server
+PIDFILE=/var/run/$NAME.pid
+STOP_TIMEOUT_SECONDS=10
+START_CHECK_SECONDS=3
+
+VMS_CAMERA_SERVER_ARGS=""
+[ -r /etc/default/$NAME ] && . /etc/default/$NAME
+
+
+# PID 파일의 프로세스가 살아 있으면 0을 반환한다.
+is_running() {
+    [ -s "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null
+}
+
+
+do_start() {
+    if is_running; then
+        echo "$NAME: 이미 실행 중입니다 (PID $(cat "$PIDFILE"))"
+        return 0
+    fi
+
+    # 서버가 이전에 스스로 끝나 남은 PID 파일은, 새 PID가 기록되기 전에 지운다.
+    rm -f "$PIDFILE"
+
+    # 서버를 실행하고, 서버의 출력을 syslog에 기록한다.
+    #
+    # PID 파일에는 vms_camera_server의 PID가 들어가야 한다. 그래야 stop의 SIGTERM을 서버가 직접 받는다.
+    # 그래서 서브셸이 서버를 백그라운드로 실행한다. 그다음 서브셸은 $!를 PID 파일에 쓰고, 서버가 끝날 때까지 기다린다.
+    #
+    # 서브셸과 logger는 파이프로 이어져 동시에 시작한다. 리다이렉션은 각 프로세스가 명령을 실행하기 직전에 적용된다.
+    # - 서브셸: 표준 입력은 /dev/null이다. 표준 출력과 표준 오류는 logger로 가는 파이프다. 서버는 이 표준 입출력을 물려받는다.
+    # - logger: 표준 입력은 서브셸에서 오는 파이프다. 표준 출력과 표준 오류는 /dev/null이다.
+    # logger는 서버가 출력한 줄을 받는 대로 syslog 소켓으로 보낸다. 그래서 logger의 출력을 /dev/null로 보내도 서버 로그는 남는다.
+    # 파이프의 쓰는 쪽은 서브셸과 서버가 함께 가진다. 서버가 끝나면 서브셸의 wait가 돌아오고, 서브셸도 끝난다.
+    # 쓰는 쪽을 가진 프로세스가 모두 끝나면, 커널은 logger의 다음 읽기에 EOF를 돌려준다. 그러면 logger는 스스로 끝난다.
+    #
+    # 리다이렉션으로 바꾸지 않은 표준 입출력은 start를 부른 쪽(ssh 연결, 콘솔)에서 물려받는다.
+    # ssh는 원격 명령의 표준 출력 파이프와 표준 오류 파이프를 가진 프로세스가 모두 없어져야 끝난다.
+    # 지금은 서버와 logger가 ssh의 파이프를 갖지 않으므로, start 스크립트가 끝나면 ssh도 끝난다.
+    # logger에 > /dev/null 2>&1이 없으면 logger의 표준 출력과 표준 오류가 ssh의 파이프가 된다. 그러면 서버, 서브셸, logger가 모두 끝나야 ssh가 끝난다.
+    (
+        # VMS_CAMERA_SERVER_ARGS는 인자 여러 개로 나뉘어야 하므로 따옴표로 감싸지 않는다.
+        $DAEMON $VMS_CAMERA_SERVER_ARGS 2>&1 &
+        echo $! > "$PIDFILE"
+        wait
+    ) < /dev/null 2>&1 | logger -t $NAME > /dev/null 2>&1 &
+
+    # 서브셸은 비동기로 PID 파일을 쓴다. 곧바로 이어지는 stop이나 start가 PID를 찾도록, 기록될 때까지 잠시 기다린다.
+    for attempt in 1 2 3 4 5; do
+        [ -s "$PIDFILE" ] && break
+        sleep 1
+    done
+
+    # 서버는 시작 직후 카메라 장치를 확인하고, 확인에 실패하면 바로 종료한다.
+    # 그래서 잠시 기다린 뒤에도 서버가 실행 중일 때만 시작에 성공한 것으로 본다.
+    sleep $START_CHECK_SECONDS
+    if ! is_running; then
+        rm -f "$PIDFILE"
+        echo "$NAME: 시작 직후 종료되었습니다. 원인은 /var/log/messages에서 확인하세요"
+        return 1
+    fi
+    echo "$NAME: 시작했습니다 (PID $(cat "$PIDFILE"))"
+}
+
+
+do_stop() {
+    if ! is_running; then
+        echo "$NAME: 실행 중이 아닙니다"
+        rm -f "$PIDFILE"
+        return 0
+    fi
+
+    pid=$(cat "$PIDFILE")
+    kill -TERM "$pid"
+
+    # 서버는 SIGTERM을 받으면 클라이언트 연결과 장치를 닫고 끝난다. 포트가 해제된 뒤 반환하도록 끝날 때까지 기다린다.
+    waited_seconds=0
+    while kill -0 "$pid" 2>/dev/null && [ $waited_seconds -lt $STOP_TIMEOUT_SECONDS ]; do
+        sleep 1
+        waited_seconds=$((waited_seconds + 1))
+    done
+
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "$NAME: ${STOP_TIMEOUT_SECONDS}초 안에 종료되지 않았습니다 (PID $pid)"
+        return 1
+    fi
+    rm -f "$PIDFILE"
+    echo "$NAME: 중지했습니다"
+}
+
+
+case "$1" in
+    start)
+        do_start
+        ;;
+    stop)
+        do_stop
+        ;;
+    restart)
+        do_stop && do_start
+        ;;
+    *)
+        echo "사용법: $0 {start|stop|restart}"
+        exit 2
+        ;;
+esac
